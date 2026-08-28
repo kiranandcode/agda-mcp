@@ -63,6 +63,33 @@ cabal run agda-mcp
 
 The server starts on `http://localhost:3000/mcp` by default.
 
+## Building without Nix (this fork)
+
+This fork adds a plain-`cabal` build so no Nix is required:
+
+- `mcp-server` (which is not on Hackage) is vendored under `vendor/mcp-server/`
+  at the commit upstream's flake pinned (`drshade/haskell-mcp-server@92c70a9`)
+  with `patches/mcp-server-header-optional.patch` already applied.
+- `cabal.project` wires that in and pins `Agda ==2.8.0` from Hackage. The build
+  needs **GHC 9.10** (mcp-server requires `base >= 4.20`); install it with
+  `ghcup install ghc 9.10.2`.
+
+```sh
+cabal build exe:agda-mcp
+cabal run  exe:agda-mcp          # serves http://localhost:3000/mcp
+```
+
+The listening port is configurable via `AGDA_MCP_PORT` (upstream hardcodes 3000),
+so a pool of instances can run — one per parallel worker — for isolation without
+relying on the client passing a `sessionId`:
+
+```sh
+AGDA_DIR=/path/to/agdadir ./scripts/serve-pool.sh 4   # ports 3000..3003
+```
+
+Point the Agda's library search at your project's dependencies by setting
+`AGDA_DIR` to a directory containing `libraries` and `defaults`.
+
 ## Configuration
 
 ### Claude Code

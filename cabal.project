@@ -1,0 +1,23 @@
+-- No-Nix build of agda-mcp.
+--
+-- Upstream builds via a Nix flake (GHC 9.10 + Agda from nixpkgs + a patched
+-- mcp-server). This project file reproduces that with plain cabal:
+--   * mcp-server is vendored under vendor/ at the flake's pinned commit
+--     (drshade/haskell-mcp-server @ 92c70a9) with patches/ applied, so no Nix
+--     and no network fetch of the git dependency are needed.
+--   * Agda 2.8.0 (the library `Agda >= 2.8.0` asks for) comes from Hackage.
+--   * mcp-server needs base >= 4.20, so the build requires GHC 9.10.
+
+packages:
+  .
+  vendor/mcp-server
+
+with-compiler: ghc-9.10.2
+
+-- Agda's dev library is on Hackage up to 2.8.0; pin it so the solver does not
+-- wander, and keep its optimisation modest to shorten the (large) build.
+constraints:
+  Agda ==2.8.0
+
+package Agda
+  optimization: 1

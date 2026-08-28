@@ -7,6 +7,9 @@ module Main where
 import MCP.Server
 import MCP.Server.Derive
 import System.IO (hSetEncoding, stderr, stdout, utf8, hPutStrLn)
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
+import MCP.Server.Transport.Http (defaultHttpConfig)
 
 import AgdaMCP.Server
 import AgdaMCP.Types
@@ -17,7 +20,10 @@ main = do
   hSetEncoding stdout utf8
   hSetEncoding stderr utf8
 
-  hPutStrLn stderr "Starting Agda MCP Server on http://localhost:3000/mcp"
+  -- Port is configurable via AGDA_MCP_PORT so a pool of instances can run, one
+  -- per parallel worker (upstream hardcodes 3000).
+  port <- maybe 3000 id . (>>= readMaybe) <$> lookupEnv "AGDA_MCP_PORT"
+  hPutStrLn stderr ("Starting Agda MCP Server on http://localhost:" ++ show port ++ "/mcp")
   hPutStrLn stderr "Session isolation enabled: pass 'sessionId' parameter for multi-agent support"
 
   -- Initialize session manager (replaces single server state)
@@ -34,8 +40,9 @@ main = do
       tools = $(deriveToolHandlerWithDescription ''AgdaTool 'handleTool agdaToolDescriptions)
       resources = $(deriveResourceHandlerWithDescription ''AgdaResource 'handleResource agdaResourceDescriptions)
 
-   in -- Run the MCP server with HTTP transport
-      runMcpServerHttp
+   in -- Run the MCP server with HTTP transport (port from AGDA_MCP_PORT)
+      runMcpServerHttpWithConfig
+        (defaultHttpConfig { httpPort = port })
         McpServerInfo
           { serverName = "Agda MCP Server"
           , serverVersion = "1.0.0"
