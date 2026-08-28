@@ -23,6 +23,9 @@ main = do
   -- Port is configurable via AGDA_MCP_PORT so a pool of instances can run, one
   -- per parallel worker (upstream hardcodes 3000).
   port <- maybe 3000 id . (>>= readMaybe) <$> lookupEnv "AGDA_MCP_PORT"
+  -- Verbose HTTP logging when AGDA_MCP_VERBOSE is set (handy for debugging the
+  -- client handshake).
+  verbose <- maybe False (const True) <$> lookupEnv "AGDA_MCP_VERBOSE"
   hPutStrLn stderr ("Starting Agda MCP Server on http://localhost:" ++ show port ++ "/mcp")
   hPutStrLn stderr "Session isolation enabled: pass 'sessionId' parameter for multi-agent support"
 
@@ -42,7 +45,7 @@ main = do
 
    in -- Run the MCP server with HTTP transport (port from AGDA_MCP_PORT)
       runMcpServerHttpWithConfig
-        (defaultHttpConfig { httpPort = port })
+        (defaultHttpConfig { httpPort = port, httpVerbose = verbose })
         McpServerInfo
           { serverName = "Agda MCP Server"
           , serverVersion = "1.0.0"

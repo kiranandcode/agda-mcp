@@ -58,11 +58,13 @@ getMessageSummary (JsonRpcMessageNotification notif) =
 getMessageSummary (JsonRpcMessageResponse resp) = 
   "Response[" ++ show (responseId resp) ++ "]"
 
--- | Validate protocol version and return negotiated version
+-- | Negotiate the protocol version. The MCP core (initialize / tools list /
+-- tools call) is stable across dated revisions, so instead of rejecting any
+-- version other than 2025-06-18 -- which locks out newer clients such as
+-- opencode (2025-11-25) -- accept the client's requested version and echo it
+-- back. The client then proceeds against the shared, stable surface.
 validateProtocolVersion :: Text -> Either Text Text
-validateProtocolVersion clientVersion
-  | clientVersion == protocolVersion = Right protocolVersion  -- Exact match (2025-06-18)
-  | otherwise = Left $ "Unsupported protocol version: " <> clientVersion <> ". Server only supports: 2025-06-18"
+validateProtocolVersion clientVersion = Right clientVersion
 
 -- | Handle an MCP message and return a response if needed
 handleMcpMessage :: (MonadIO m)

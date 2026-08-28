@@ -10,6 +10,7 @@ module MCP.Server.Transport.Http
 
 import           Control.Monad            (when)
 import           Data.Aeson
+import qualified Data.ByteString.Builder  as BB
 import qualified Data.ByteString.Lazy     as BSL
 import           Data.String              (IsString (fromString))
 import           Data.Text                (Text)
@@ -83,31 +84,28 @@ handleMcpRequest config serverInfo handlers req respond = do
 
   -- Process request regardless of header presence
   case Wai.requestMethod req of
-    -- GET requests for endpoint discovery
-    "GET" -> do
-      let discoveryResponse = object
-            [ "name" .= serverName serverInfo
-            , "version" .= serverVersion serverInfo
-            , "description" .= serverInstructions serverInfo
-            , "protocolVersion" .= ("2025-06-18" :: Text)
-            , "capabilities" .= object
-                [ "tools" .= object []
-                , "prompts" .= object []
-                , "resources" .= object []
-                ]
-            ]
-      logVerbose config $ "Sending server discovery response: " ++ show discoveryResponse
-      respond $ Wai.responseLBS
-        status200
-        [("Content-Type", "application/json"), ("Access-Control-Allow-Origin", "*")]
-        (encode discoveryResponse)
+    -- GET is the Streamable HTTP spec's channel for a server->client SSE
+    -- stream. This server is request/response only, so it must decline GET with
+    -- 405 (per spec) rather than return a JSON blob: MCP clients such as
+    -- opencode open this GET at connect expecting `text/event-stream`, and a
+    -- `200 application/json` here makes them mark the whole server unavailable.
+    "GET" -> respond $ Wai.responseLBS
+      status405
+      [("Content-Type", "text/plain"), ("Allow", "POST, OPTIONS"), ("Access-Control-Allow-Origin", "*")]
+      "Method Not Allowed: this server supports POST (request/response) only"
 
     -- POST requests for JSON-RPC messages
     "POST" -> do
       -- Read request body
       body <- Wai.strictRequestBody req
       logVerbose config $ "Received POST body (" ++ show (BSL.length body) ++ " bytes): " ++ take 200 (show body)
-      handleJsonRpcRequest config serverInfo handlers body respond
+      -- Streamable HTTP: if the client accepts an event stream (opencode always
+      -- does), answer as text/event-stream, not application/json -- its client
+      -- refuses a plain JSON response and marks the server unavailable.
+      let wantsSSE = maybe False
+            (\v -> "text/event-stream" `T.isInfixOf` TE.decodeUtf8 v)
+            (lookup hAccept (Wai.requestHeaders req))
+      handleJsonRpcRequest config wantsSSE serverInfo handlers body respond
 
     -- OPTIONS for CORS preflight
     "OPTIONS" -> respond $ Wai.responseLBS
@@ -124,9 +122,37 @@ handleMcpRequest config serverInfo handlers req respond = do
       [("Content-Type", "text/plain"), ("Allow", "GET, POST, OPTIONS")]
             "Method Not Allowed"
 
+-- A fixed `Mcp-Session-Id` satisfies clients (opencode) that expect
+-- `initialize` to assign one; this server is stateless and keys its own sessions
+-- off a tool argument, so it accepts any id and ignores it on later requests.
+
+-- | A single JSON-RPC message as a plain application/json response.
+jsonResponse :: BSL.ByteString -> Wai.Response
+jsonResponse body = Wai.responseLBS
+  status200
+  [ ("Content-Type", "application/json")
+  , ("Access-Control-Allow-Origin", "*")
+  , ("Mcp-Session-Id", "agda-mcp")
+  ]
+  body
+
+-- | A single JSON-RPC message as one Server-Sent Event, then the stream closes
+-- (Streamable HTTP allows the server to end the stream after the response).
+sseResponse :: BSL.ByteString -> Wai.Response
+sseResponse body = Wai.responseStream
+  status200
+  [ ("Content-Type", "text/event-stream")
+  , ("Cache-Control", "no-cache")
+  , ("Access-Control-Allow-Origin", "*")
+  , ("Mcp-Session-Id", "agda-mcp")
+  ]
+  (\write flush -> do
+      write (BB.byteString "event: message\ndata: " <> BB.lazyByteString body <> BB.byteString "\n\n")
+      flush)
+
 -- | Handle JSON-RPC request from HTTP body
-handleJsonRpcRequest :: HttpConfig -> McpServerInfo -> McpServerHandlers IO -> BSL.ByteString -> (Wai.Response -> IO Wai.ResponseReceived) -> IO Wai.ResponseReceived
-handleJsonRpcRequest config serverInfo handlers body respond = do
+handleJsonRpcRequest :: HttpConfig -> Bool -> McpServerInfo -> McpServerHandlers IO -> BSL.ByteString -> (Wai.Response -> IO Wai.ResponseReceived) -> IO Wai.ResponseReceived
+handleJsonRpcRequest config wantsSSE serverInfo handlers body respond = do
   case eitherDecode body of
     Left err -> do
       hPutStrLn stderr $ "JSON parse error: " ++ err
@@ -135,11 +161,11 @@ handleJsonRpcRequest config serverInfo handlers body respond = do
         [("Content-Type", "application/json")]
         (encode $ object ["error" .= ("Invalid JSON" :: Text)])
 
-    Right jsonValue -> handleSingleJsonRpc config serverInfo handlers jsonValue respond
+    Right jsonValue -> handleSingleJsonRpc config wantsSSE serverInfo handlers jsonValue respond
 
 -- | Handle a single JSON-RPC message
-handleSingleJsonRpc :: HttpConfig -> McpServerInfo -> McpServerHandlers IO -> Value -> (Wai.Response -> IO Wai.ResponseReceived) -> IO Wai.ResponseReceived
-handleSingleJsonRpc config serverInfo handlers jsonValue respond = do
+handleSingleJsonRpc :: HttpConfig -> Bool -> McpServerInfo -> McpServerHandlers IO -> Value -> (Wai.Response -> IO Wai.ResponseReceived) -> IO Wai.ResponseReceived
+handleSingleJsonRpc config wantsSSE serverInfo handlers jsonValue respond = do
   case parseJsonRpcMessage jsonValue of
     Left err -> do
       hPutStrLn stderr $ "JSON-RPC parse error: " ++ err
@@ -156,17 +182,14 @@ handleSingleJsonRpc config serverInfo handlers jsonValue respond = do
         Just responseMsg -> do
           let responseJson = encode $ encodeJsonRpcMessage responseMsg
           logVerbose config $ "Sending HTTP response for: " ++ show (getMessageSummary message)
-          respond $ Wai.responseLBS
-            status200
-            [("Content-Type", "application/json"), ("Access-Control-Allow-Origin", "*")]
-            responseJson
+          respond $ if wantsSSE then sseResponse responseJson else jsonResponse responseJson
 
         Nothing -> do
           logVerbose config $ "No response needed for: " ++ show (getMessageSummary message)
-          -- For notifications, return 200 with empty JSON object (per MCP spec)
-          respond $ Wai.responseLBS 
-            status200 
-            [("Content-Type", "application/json"), ("Access-Control-Allow-Origin", "*")] 
-            "{}"
+          -- Notifications have no response body; acknowledge with 202 Accepted.
+          respond $ Wai.responseLBS
+            status202
+            [("Access-Control-Allow-Origin", "*"), ("Mcp-Session-Id", "agda-mcp")]
+            ""
 
 
