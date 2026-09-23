@@ -31,8 +31,8 @@ import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 -- - Removes prompt printing (no human interaction)
 -- - Keeps all state management logic
 -- - Returns only when command source returns Done
-mcpRepl :: InteractionOutputCallback -> IO Command -> TCM () -> TCM ()
-mcpRepl callback readCmd setup = do
+mcpRepl :: InteractionOutputCallback -> IO Command -> TCM () -> TCM () -> TCM ()
+mcpRepl callback readCmd setup afterCommand = do
     liftIO $ do
       hSetBuffering stdout LineBuffering
       hSetEncoding  stdout utf8
@@ -56,13 +56,14 @@ mcpRepl callback readCmd setup = do
       r <- maybeAbort runInteraction
       case r of
         Done      -> return True -- Done.
-        Command _ -> return False
+        Command _ -> lift afterCommand >> return False
         Error s   -> do
           exit <- optExitOnError <$> commandLineOptions
           if exit
             then liftIO (exitAgdaWith CommandError)
             else do
               liftIO (putStrLn s)
+              lift afterCommand
               return False
 
     lift Bench.print

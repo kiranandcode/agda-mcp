@@ -370,24 +370,63 @@ Introduce variables using the intro tactic.
 
 ### 11. `agda_why_in_scope`
 
-Look up documentation and scope information for a name.
+Explain what a name refers to.
 
 **Arguments:**
 - `name` (string): The name to look up
+- `inFile` (string, optional): A loaded file whose uses of the name to resolve (default: the loaded file)
+- `atLine` (number, optional): Prefer the use nearest this line
+
+Asks Agda's top-level scope first and returns its answer when the name is in
+scope there. Names opened only inside a nested, parameterised, or private
+module (most lemmas in a library proof) are not; for those it resolves a use
+of the name in the file instead, as `agda_lookup` does.
+
+---
+
+### 12. `agda_lookup`
+
+Look up a name as it is used in a loaded file.
+
+**Arguments:**
+- `file` (string): A file loaded in this session
+- `symbol` (string): The name as written, e.g. `+-comm`, `Eq.sym`, `_∘_`
+- `atLine` (number, optional): Prefer the use nearest this line
 
 **Example:**
 ```json
 {
-  "name": "agda_why_in_scope",
-  "arguments": {
-    "name": "suc"
-  }
+  "name": "agda_lookup",
+  "arguments": { "file": "/path/to/Data/Nat/DivMod.agda", "symbol": "m∸n+n≡m" }
 }
 ```
 
-**Returns:** Information about where the name is defined and why it's in scope.
+**Returns:**
+```
+m∸n+n≡m (line 90, column 35) -- Function
+  name:    Data.Nat.Properties.m∸n+n≡m
+  type:    {m n : ℕ} → n ≤ m → m ∸ n + n ≡ m
+  defined: /path/to/Data/Nat/Properties.agda:1696:1
+  source:
+    m∸n+n≡m : ∀ {m n} → n ≤ m → (m ∸ n) + n ≡ m
+```
+(`"format": "Full"` gives the same as JSON.)
 
-**Use Case:** Understand the origin and definition of functions, types, or constructors.
+Every name occurrence in a type-checked file records where the name is
+defined, so this works however the name came into scope: through nested or
+private modules, `open ... renaming`, qualified uses (`Eq.sym`), or a part of a
+mixfix operator (`_≈⟨_⟩_`). The type is printed in the defining module's
+scope, and copies made by opening a module resolve to the original definition.
+No column is needed; with several uses, the one nearest `atLine` wins.
+
+---
+
+### 13. `agda_goto_definition`
+
+The same lookup for the name at a position.
+
+**Arguments:**
+- `file` (string), `line` (number), `column` (number): 1-indexed position of a name in a loaded file
 
 ---
 
