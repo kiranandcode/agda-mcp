@@ -45,7 +45,8 @@ data AgdaTool
     | AgdaSearchAbout { query :: Text, sessionId :: Maybe Text, format :: Maybe Text }
     | AgdaShowModule { moduleName :: Text, sessionId :: Maybe Text, format :: Maybe Text }
     | AgdaShowConstraints { sessionId :: Maybe Text, format :: Maybe Text }
-    | AgdaWhyInScope { name :: Text, sessionId :: Maybe Text, format :: Maybe Text }
+    | AgdaWhyInScope { name :: Text, inFile :: Maybe Text, atLine :: Maybe Int, sessionId :: Maybe Text, format :: Maybe Text }
+    | AgdaLookup { file :: Text, symbol :: Text, atLine :: Maybe Int, sessionId :: Maybe Text, format :: Maybe Text }
     | AgdaListPostulates { file :: Text, sessionId :: Maybe Text, format :: Maybe Text }
     deriving (Show, Eq)
 
@@ -79,11 +80,12 @@ agdaToolDescriptions =
     , ("AgdaHelperFunction", "Generate a helper function skeleton for a goal (useful for refactoring)")
     , ("AgdaGoalTypeContext", "Get both the goal type and context together (more efficient than separate calls)")
     , ("AgdaGoalAtPosition", "Find which goal exists at a specific file position (line and column)")
-    , ("AgdaGotoDefinition", "Navigate to the definition of a symbol at a specific position (like agda2-mode's M-. / goto-definition)")
+    , ("AgdaGotoDefinition", "Go to the definition of the name at a line and column of a loaded file (like agda2-mode's M-.). Returns its qualified name, type, defining file:line, and the definition's source lines. Works for any name Agda resolved, including ones only in scope inside nested or private modules.")
     , ("AgdaSearchAbout", "Search for definitions by name or type signature (Hoogle-style search)")
     , ("AgdaShowModule", "Show the contents of a module (all exported definitions, types, and submodules)")
     , ("AgdaShowConstraints", "Show all unsolved type-checking constraints in the current file")
-    , ("AgdaWhyInScope", "Look up documentation and scope information for a name")
+    , ("AgdaWhyInScope", "Explain what a name refers to. Asks Agda's top-level scope first; if the name is not in scope there (e.g. it is only opened inside a nested or private module), resolves a use of it in the file instead (inFile, else the loaded file), reporting its qualified name, type, and definition site.")
+    , ("AgdaLookup", "Look up a name as it is used in a loaded file: its qualified name, type, defining file:line, and the definition's source lines. Finds the use of `symbol` nearest `atLine` (or the first), so no column is needed. Resolves names from nested/parameterised/private modules, qualified uses (`Eq.sym`), and mixfix operator parts (`_≈⟨_⟩_`). The file must have been loaded with agda_load in this session.")
     , ("AgdaListPostulates", "List all postulates in a file with their names, types, and positions. Useful for converting postulates to holes for implementation.")
     , ("file", "Path to the Agda file")
     , ("moduleName", "Fully qualified module name (e.g., 'Data.Nat', 'Agda.Builtin.Nat')")
@@ -92,6 +94,9 @@ agdaToolDescriptions =
     , ("variable", "Name of the variable to case-split on")
     , ("query", "Search query: can be a name pattern or type signature to search for")
     , ("name", "Name to look up in scope")
+    , ("symbol", "The name to look up, as written in the file (e.g. '+-comm', 'Eq.sym', '_∘_')")
+    , ("inFile", "Optional: a loaded file whose uses of the name to resolve when it is not in top-level scope (default: the loaded file)")
+    , ("atLine", "Optional: prefer the use of the name nearest this line (1-indexed)")
     , ("helperName", "Suggested name for the generated helper function")
     , ("line", "Line number in the file (1-indexed)")
     , ("column", "Column number in the line (1-indexed)")

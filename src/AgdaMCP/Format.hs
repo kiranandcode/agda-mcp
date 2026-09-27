@@ -67,6 +67,7 @@ getFormat tool =
         Types.AgdaShowModule{Types.format=fmt} -> fmt
         Types.AgdaShowConstraints{Types.format=fmt} -> fmt
         Types.AgdaWhyInScope{Types.format=fmt} -> fmt
+        Types.AgdaLookup{Types.format=fmt} -> fmt
         Types.AgdaListPostulates{Types.format=fmt} -> fmt
   in parseFormat formatText
 
@@ -199,7 +200,9 @@ formatGoalType infoValue =
 -- Format why in scope
 formatWhyInScope :: JSON.Value -> Text
 formatWhyInScope infoValue =
-  extractText infoValue
+  case getField "message" infoValue of
+    Just (JSON.String msg) -> msg
+    _ -> extractText infoValue
 
 -- Format intro suggestions
 formatIntro :: JSON.Value -> Text

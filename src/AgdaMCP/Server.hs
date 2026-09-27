@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wno-unused-top-binds #-}
 {-# OPTIONS_GHC -Wno-unused-record-wildcards #-}
 
@@ -37,6 +38,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Chan (Chan, newChan, writeChan, readChan)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.Async (race, async, waitCatch, Async)
+import Control.Concurrent.STM (TVar, newTVarIO, readTVar, modifyTVar', atomically, check, registerDelay)
 import System.Timeout (timeout)
 import System.FilePath (takeDirectory)
 import System.Directory (listDirectory)
@@ -47,6 +49,7 @@ import qualified AgdaMCP.Types
 import qualified AgdaMCP.Repl as Repl
 import qualified AgdaMCP.SessionManager as SessionManager
 import qualified AgdaMCP.FileEdit as FileEdit
+import qualified AgdaMCP.Lookup as Lookup
 
 -- Agda imports - using the actual interaction functions
 import Agda.Interaction.Base
@@ -123,11 +126,13 @@ data CommandWithResponse = CommandWithResponse
 data ServerState = ServerState
   { currentFile :: Maybe AbsolutePath
   , checkResult :: Maybe CheckResult
-  , highlightingInfo :: Maybe JSON.Value     -- Cached highlighting info for goto-def/find-refs
+  , highlightingInfo :: Maybe JSON.Value     -- Unused; kept for the constructor's shape
+  , replSnapshot :: Maybe Lookup.Snapshot     -- REPL env+state after its latest command, for lookups
+  , replProgress :: TVar (Int, Int)            -- (commands sent, commands finished) by the REPL
   , commandChan :: Chan CommandWithResponse  -- Channel to send commands to REPL
   , replAsync :: Maybe (Async ())            -- Background REPL thread handle
   , shutdownVar :: MVar ()                   -- Shutdown signal for graceful termination
-  , currentResponseVar :: IORef (Maybe (MVar JSON.Value))  -- Current response MVar for encoded JSON
+  , currentResponseVar :: IORef [MVar JSON.Value]  -- Reply slots of commands sent to the REPL and not yet finished, oldest first
   }
 
 -- ============================================================================
@@ -136,7 +141,7 @@ data ServerState = ServerState
 
 -- | Read IOTCM commands from channel, store response MVar, and wrap in Command type
 -- Uses race to allow graceful shutdown when shutdownVar is signaled
-readCommandFromChan :: IORef (Maybe (MVar JSON.Value)) -> MVar () -> Chan CommandWithResponse -> IO Command
+readCommandFromChan :: IORef [MVar JSON.Value] -> MVar () -> Chan CommandWithResponse -> IO Command
 readCommandFromChan responseVarRef shutdownVar chan = do
   result <- race (takeMVar shutdownVar) (readChan chan)
   case result of
@@ -146,13 +151,16 @@ readCommandFromChan responseVarRef shutdownVar chan = do
       return Done
     Right (CommandWithResponse iotcm responseVar) -> do
       -- Store the response MVar so callback can use it
-      writeIORef responseVarRef (Just responseVar)
+      -- Queue its reply slot. Agda reads commands ahead of running them, so
+      -- the slot must not replace that of a command still running: responses
+      -- go to the oldest unfinished command's slot (see 'afterReplCommand').
+      atomicModifyIORef' responseVarRef (\vars -> (vars ++ [responseVar], ()))
       return $ Command iotcm
 
 -- | Callback for capturing Agda responses and routing to waiting handlers
 -- Pattern match on specific response types we care about
 -- Encode responses in the TCM context before routing
-mcpCallback :: IORef ServerState -> IORef (Maybe (MVar JSON.Value)) -> Response -> TCM ()
+mcpCallback :: IORef ServerState -> IORef [MVar JSON.Value] -> Response -> TCM ()
 mcpCallback stateRef responseVarRef resp = do
   let isContentResponse = case resp of
         Resp_InteractionPoints _ -> True
@@ -162,7 +170,7 @@ mcpCallback stateRef responseVarRef resp = do
         Resp_SolveAll _ -> True
         Resp_JumpToError _ _ -> True
         Resp_Status _ -> False
-        Resp_HighlightingInfo _ _ _ _ -> True  -- Now capturing highlighting info
+        Resp_HighlightingInfo _ _ _ _ -> False  -- lookups read highlighting from the REPL snapshot
         Resp_RunningInfo _ _ -> False
         Resp_ClearRunningInfo -> False
         Resp_ClearHighlighting _ -> False
@@ -194,17 +202,15 @@ mcpCallback stateRef responseVarRef resp = do
           putStrLn "Highlighting info captured and stored in state"
         _ -> do
           -- Route to waiting handler for other content responses
-          maybeVar <- liftIO $ readIORef responseVarRef
-          case maybeVar of
-            Just responseVar -> liftIO $ do
+          -- (the first content response of the running command answers it)
+          pending <- liftIO $ readIORef responseVarRef
+          case pending of
+            responseVar : _ -> liftIO $ do
               success <- tryPutMVar responseVar jsonValue
-              if success
-                then do
-                  putStrLn "Agda response encoded and routed to handler"
-                  writeIORef responseVarRef Nothing
-                else
-                  putStrLn "Agda response ignored (handler already has response)"
-            Nothing -> liftIO $
+              putStrLn $ if success
+                then "Agda response encoded and routed to handler"
+                else "Agda response ignored (handler already has response)"
+            [] -> liftIO $
               putStrLn "Warning: Received response with no waiting handler"
     else liftIO $
       putStrLn "Agda non-content response (skipped)"
@@ -352,6 +358,9 @@ toolToIOTCM currentFilePath tool =
       IOTCM currentFilePath None Direct Cmd_constraints
     AgdaMCP.Types.AgdaWhyInScope{name} ->
       IOTCM currentFilePath None Direct (Cmd_why_in_scope_toplevel (T.unpack name))
+    AgdaMCP.Types.AgdaLookup{file} ->
+      -- Never reached: AgdaLookup is handled separately in handleAgdaTool
+      IOTCM (T.unpack file) None Direct (Cmd_load (T.unpack file) [])
     AgdaMCP.Types.AgdaListPostulates{file} ->
       -- This case should never be reached as AgdaListPostulates is handled separately in handleAgdaTool
       -- We include it here for pattern match exhaustiveness
@@ -634,80 +643,6 @@ mcpGoalAtPosition stateRef filepath line col = do
       | targetLine == endLine && targetCol > endCol = False
       | otherwise = True
 
-mcpGotoDefinition :: IORef ServerState -> FilePath -> Int -> Int -> TCM AgdaResult
-mcpGotoDefinition stateRef filepath line col = do
-  -- Wrap in error handler
-  catchError
-    (do
-      -- Use cached load if available
-      checked <- loadFileWithCache stateRef filepath
-
-      -- Extract highlighting directly from the interface after type-checking
-      -- This is synchronous and doesn't require waiting for async callbacks
-      let interface = crInterface checked
-      let highlighting = iHighlighting interface
-
-      liftIO $ putStrLn $ "Extracted highlighting directly from interface"
-
-      -- We need to convert HighlightingInfo to JSON
-      -- HighlightingInfo is RangeMap Aspects
-      -- Let's check what the callback received and log it
-      stateAfterLoad <- liftIO $ readIORef stateRef
-      case highlightingInfo stateAfterLoad of
-        Nothing -> do
-          liftIO $ putStrLn "No highlighting in callback, but we have it from interface"
-          -- For now, return error - need to implement direct conversion
-          pure $ AgdaResult False "Highlighting available but conversion not yet implemented. Need to parse RangeMap Aspects directly." Nothing
-        Just highlightJson -> do
-          liftIO $ do
-            let jsonText = TE.decodeUtf8 $ LBS.toStrict $ JSON.encode highlightJson
-            putStrLn $ "Highlighting JSON from callback (first 2000 chars): " ++ take 2000 (T.unpack jsonText)
-          -- Parse highlighting to find definition at position
-          case findDefinitionAtPosition highlightJson line col of
-            Nothing -> pure $ AgdaResult False "No definition found at specified position. The position may be on whitespace, keywords, or symbols without definition sites." Nothing
-            Just defInfo -> pure $ AgdaResult True "Success" (Just defInfo)
-    )
-    (\err -> do
-      errMsg <- prettyTCM err
-      let simplifiedMsg = T.pack $ take 500 $ render errMsg
-      pure $ AgdaResult False ("Type-checking failed: " <> simplifiedMsg) Nothing
-    )
-  where
-    findDefinitionAtPosition :: JSON.Value -> Int -> Int -> Maybe JSON.Value
-    findDefinitionAtPosition highlightJson line col = do
-      -- Extract payload array from highlighting JSON structure
-      info <- getJSONField "info" highlightJson
-      payload <- getJSONField "payload" info
-      payloadArray <- case payload of
-        JSON.Array arr -> Just arr
-        _ -> Nothing
-
-      -- Search through payload for entry at given position
-      findMatchingEntry (V.toList payloadArray) line col
-
-    findMatchingEntry :: [JSON.Value] -> Int -> Int -> Maybe JSON.Value
-    findMatchingEntry [] _ _ = Nothing
-    findMatchingEntry (entry:rest) targetLine targetCol = do
-      -- Check if this entry's range contains the target position
-      rangeVal <- getJSONField "range" entry
-      (startPos, endPos) <- case rangeVal of
-        JSON.Array arr | V.length arr >= 2 ->
-          case (arr V.! 0, arr V.! 1) of
-            (JSON.Number s, JSON.Number e) -> Just (floor s :: Int, floor e :: Int)
-            _ -> Nothing
-        _ -> Nothing
-
-      -- Ranges in Agda highlighting are character offsets, not line/col
-      -- For now, skip position matching and just look for definitionSite
-      defSite <- getJSONField "definitionSite" entry
-      case defSite of
-        JSON.Null -> findMatchingEntry rest targetLine targetCol
-        _ -> Just defSite  -- Found a definition site
-
-    getJSONField :: Text -> JSON.Value -> Maybe JSON.Value
-    getJSONField field (JSON.Object obj) = JSON.KeyMap.lookup (JSON.Key.fromText field) obj
-    getJSONField _ _ = Nothing
-
 mcpGetGoals :: IORef ServerState -> TCM AgdaResult
 mcpGetGoals stateRef = do
   ensureFileLoaded stateRef
@@ -864,9 +799,10 @@ renderConstraintContext _constraint = do
 initServerState :: IO (IORef ServerState)
 initServerState = do
   chan <- newChan
-  responseVarRef <- newIORef Nothing
+  responseVarRef <- newIORef []
   shutdownVar <- newEmptyMVar
-  stateRef <- newIORef (ServerState Nothing Nothing Nothing chan Nothing shutdownVar responseVarRef)
+  progress <- newTVarIO (0, 0)
+  stateRef <- newIORef (ServerState Nothing Nothing Nothing Nothing progress chan Nothing shutdownVar responseVarRef)
 
   -- Start persistent REPL in background thread using async
   asyncHandle <- async $ do
@@ -875,6 +811,7 @@ initServerState = do
       (mcpCallback stateRef responseVarRef)          -- Response callback with state and response refs
       (readCommandFromChan responseVarRef shutdownVar chan) -- Command source with shutdown support
       (return ())                                    -- No special setup
+      (afterReplCommand stateRef responseVarRef progress)  -- Snapshot state, retire the reply slot
     case result of
       Left err -> putStrLn $ "REPL error: " ++ show err
       Right _ -> putStrLn "REPL exited normally"
@@ -913,52 +850,136 @@ handleAgdaTool stateRef tool = do
         Right (AgdaResult _ msg Nothing) -> pure $ MCP.Server.ContentText msg
 
     AgdaMCP.Types.AgdaGotoDefinition{file, line, column} -> do
-      -- Run directly in TCM to find definition at position
-      result <- runTCMTop $ mcpGotoDefinition stateRef (T.unpack file) line column
-      case result of
-        Left err -> pure $ MCP.Server.ContentText $ "Error: " <> T.pack (show err)
-        Right (AgdaResult _ _ (Just val)) -> do
-          let responseFormat = Format.getFormat tool
-          let responseText = Format.formatResponse responseFormat val
-          pure $ MCP.Server.ContentText responseText
-        Right (AgdaResult _ msg Nothing) -> pure $ MCP.Server.ContentText msg
+      path <- absolute (T.unpack file)
+      MCP.Server.ContentText <$> lookupText stateRef tool (Lookup.resolveAtPosition path line column)
+
+    AgdaMCP.Types.AgdaLookup{file, symbol, atLine} -> do
+      path <- absolute (T.unpack file)
+      MCP.Server.ContentText <$> lookupText stateRef tool (Lookup.resolveSymbol path symbol atLine)
+
+    AgdaMCP.Types.AgdaWhyInScope{name, inFile, atLine} -> do
+      -- Agda's own answer covers names in the file's top-level scope; for the
+      -- rest (opened only inside a nested or private module), resolve a use.
+      topLevel <- viaRepl stateRef tool
+      if not ("not in scope" `T.isInfixOf` topLevel)
+        then pure (MCP.Server.ContentText topLevel)
+        else do
+          state <- readIORef stateRef
+          target <- case inFile of
+            Just f -> Just <$> absolute (T.unpack f)
+            Nothing -> pure (currentFile state)
+          case target of
+            Nothing -> pure (MCP.Server.ContentText topLevel)
+            Just path -> do
+              resolved <- runLookup stateRef (Lookup.resolveSymbol path name atLine)
+              pure $ MCP.Server.ContentText $ case (resolved, Format.getFormat tool) of
+                (Left _, _) -> topLevel
+                (Right r, AgdaMCP.Types.Full) -> formatResolution tool r
+                (Right r, AgdaMCP.Types.Concise) ->
+                  name <> " is not in top-level scope; resolved from its use in the file:\n"
+                    <> formatResolution tool r
 
     -- All other tools go through REPL
-    _ -> do
-      state <- readIORef stateRef
+    _ -> MCP.Server.ContentText <$> viaRepl stateRef tool
 
-      -- Get current file path for IOTCM commands
-      let currentFilePath = case currentFile state of
-            Just absPath -> filePath absPath
-            Nothing -> ""
+-- | Send a tool to the persistent REPL and format its answer.
+viaRepl :: IORef ServerState -> AgdaMCP.Types.AgdaTool -> IO Text
+viaRepl stateRef tool = do
+  state <- readIORef stateRef
 
-      -- Convert tool to IOTCM command
-      let iotcm = toolToIOTCM currentFilePath tool
+  -- Get current file path for IOTCM commands
+  let currentFilePath = case currentFile state of
+        Just absPath -> filePath absPath
+        Nothing -> ""
 
-      -- Create response MVar and command wrapper
-      responseVar <- newEmptyMVar
-      let cmd = CommandWithResponse iotcm responseVar
+  -- Convert tool to IOTCM command
+  let iotcm = toolToIOTCM currentFilePath tool
 
-      -- Send command to persistent REPL
-      writeChan (commandChan state) cmd
-      putStrLn $ "Sent command to REPL: " ++ show tool
+  -- Create response MVar and command wrapper
+  responseVar <- newEmptyMVar
+  let cmd = CommandWithResponse iotcm responseVar
 
-      -- Wait for encoded JSON response from REPL
-      jsonValue <- takeMVar responseVar
-      putStrLn "Received encoded response from REPL"
+  -- Send command to persistent REPL
+  atomically $ modifyTVar' (replProgress state) (\(sent, done) -> (sent + 1, done))
+  writeChan (commandChan state) cmd
+  putStrLn $ "Sent command to REPL: " ++ show tool
 
-      -- If this was a successful load, update the current file in state
-      case tool of
-        AgdaMCP.Types.AgdaLoad{file} -> do
-          absPath <- absolute (T.unpack file)
-          modifyIORef stateRef (\s -> s { currentFile = Just absPath })
-          putStrLn $ "Updated current file to: " ++ T.unpack file
-        _ -> return ()
+  -- Wait for encoded JSON response from REPL
+  jsonValue <- takeMVar responseVar
+  putStrLn "Received encoded response from REPL"
 
-      -- Format response based on requested format (default: Concise)
-      let responseFormat = Format.getFormat tool
-      let responseText = Format.formatResponse responseFormat jsonValue
-      pure $ MCP.Server.ContentText responseText
+  -- If this was a successful load, update the current file in state
+  case tool of
+    AgdaMCP.Types.AgdaLoad{file} -> do
+      absPath <- absolute (T.unpack file)
+      modifyIORef stateRef (\s -> s { currentFile = Just absPath })
+      putStrLn $ "Updated current file to: " ++ T.unpack file
+    _ -> return ()
+
+  -- Format response based on requested format (default: Concise)
+  let responseFormat = Format.getFormat tool
+  let responseText = Format.formatResponse responseFormat jsonValue
+  pure responseText
+
+-- | After each REPL command: keep a snapshot of the REPL's environment and
+-- state (cheap: TCState is immutable data, this only keeps a reference) so
+-- name lookups can run against exactly what it loaded, then count the command
+-- as finished.
+--
+-- The finished command's reply slot is retired; if the command produced no
+-- content response at all, its handler gets an error rather than waiting
+-- forever.
+afterReplCommand :: IORef ServerState -> IORef [MVar JSON.Value] -> TVar (Int, Int) -> TCM ()
+afterReplCommand stateRef responseVarRef progress = do
+  env <- askTC
+  st <- getTC
+  liftIO $ do
+    modifyIORef' stateRef (\s -> s { replSnapshot = Just (env, st) })
+    finished <- atomicModifyIORef' responseVarRef $ \case
+      v : rest -> (rest, Just v)
+      [] -> ([], Nothing)
+    mapM_ (\v -> tryPutMVar v noResponse) finished
+    atomically $ modifyTVar' progress (\(sent, done) -> (sent, done + 1))
+  where
+    noResponse = JSON.object
+      [ "kind" JSON..= ("Error" :: Text)
+      , "message" JSON..= ("Agda finished the command without a response." :: Text)
+      ]
+
+-- | Run a name lookup against the REPL's state once every command sent to it
+-- has finished. A tool call returns on its first response, which can arrive
+-- before the REPL is done with the command (e.g. still finishing a load).
+runLookup
+  :: IORef ServerState -> TCM (Either Text Lookup.Resolution)
+  -> IO (Either Text Lookup.Resolution)
+runLookup stateRef lookupAction = do
+  progress <- replProgress <$> readIORef stateRef
+  timedOut <- registerDelay (120 * 1000000)
+  atomically $ do
+    (sent, done) <- readTVar progress
+    late <- readTVar timedOut
+    check (done >= sent || late)
+  state <- readIORef stateRef
+  case replSnapshot state of
+    Nothing -> pure (Left "No file loaded in this session. Use agda_load first.")
+    Just snap -> do
+      result <- Control.Exception.try (Lookup.runInSnapshot snap lookupAction)
+      pure $ case result of
+        Left (err :: Control.Exception.SomeException) -> Left ("Lookup failed: " <> T.pack (show err))
+        Right r -> r
+
+-- | Format a resolution in the tool's response format.
+formatResolution :: AgdaMCP.Types.AgdaTool -> Lookup.Resolution -> Text
+formatResolution tool r = case Format.getFormat tool of
+  AgdaMCP.Types.Full -> TE.decodeUtf8 (LBS.toStrict (JSON.encode (Lookup.resolutionJSON r)))
+  AgdaMCP.Types.Concise -> Lookup.renderResolution r
+
+-- | Run a name lookup and format its result or error.
+lookupText
+  :: IORef ServerState -> AgdaMCP.Types.AgdaTool
+  -> TCM (Either Text Lookup.Resolution) -> IO Text
+lookupText stateRef tool lookupAction =
+  either id (formatResolution tool) <$> runLookup stateRef lookupAction
 
 -- MCP Resource Handler - exposes Agda file information as resources
 -- Resources extract parameters from the URI path

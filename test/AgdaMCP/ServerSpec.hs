@@ -106,7 +106,8 @@ setFormat tool fmt = case tool of
   Types.AgdaSearchAbout{Types.query=q, Types.sessionId=sid} -> Types.AgdaSearchAbout{Types.query=q, Types.sessionId=sid, Types.format=fmt}
   Types.AgdaShowModule{Types.moduleName=m, Types.sessionId=sid} -> Types.AgdaShowModule{Types.moduleName=m, Types.sessionId=sid, Types.format=fmt}
   Types.AgdaShowConstraints{Types.sessionId=sid} -> Types.AgdaShowConstraints{Types.sessionId=sid, Types.format=fmt}
-  Types.AgdaWhyInScope{Types.name=n, Types.sessionId=sid} -> Types.AgdaWhyInScope{Types.name=n, Types.sessionId=sid, Types.format=fmt}
+  Types.AgdaWhyInScope{Types.name=n, Types.inFile=i, Types.atLine=l, Types.sessionId=sid} -> Types.AgdaWhyInScope{Types.name=n, Types.inFile=i, Types.atLine=l, Types.sessionId=sid, Types.format=fmt}
+  Types.AgdaLookup{Types.file=f, Types.symbol=y, Types.atLine=l, Types.sessionId=sid} -> Types.AgdaLookup{Types.file=f, Types.symbol=y, Types.atLine=l, Types.sessionId=sid, Types.format=fmt}
   Types.AgdaListPostulates{Types.file=f, Types.sessionId=sid} -> Types.AgdaListPostulates{Types.file=f, Types.sessionId=sid, Types.format=fmt}
 
 -- | Helper to get a field from a JSON object
@@ -149,6 +150,7 @@ tests = testGroup "AgdaMCP.Server Tests"
   , showModuleTests
   , showConstraintsTests
   , whyInScopeTests
+  , lookupTests
   , listPostulatesTests
   , MultiAgent.tests
   ]
@@ -214,6 +216,11 @@ exampleFile :: IO FilePath
 exampleFile = do
   cwd <- getCurrentDirectory
   pure $ cwd </> "test" </> "Example.agda"
+
+lookupFile :: IO FilePath
+lookupFile = do
+  cwd <- getCurrentDirectory
+  pure $ cwd </> "test" </> "LookupTest.agda"
 
 postulateFile :: IO FilePath
 postulateFile = do
@@ -833,7 +840,7 @@ whyInScopeTests = withSessionManager $ \getManager -> testGroup "agda_why_in_sco
       file <- exampleFile
       _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-why-in-scope-exists", Types.format = Nothing })
 
-      let tool = Types.AgdaWhyInScope { Types.name = "suc", Types.sessionId = Just "test-why-in-scope-exists", Types.format = Nothing }
+      let tool = Types.AgdaWhyInScope { Types.name = "suc", Types.inFile = Nothing, Types.atLine = Nothing, Types.sessionId = Just "test-why-in-scope-exists", Types.format = Nothing }
       response <- runTool manager tool
 
       let kind = getField "kind" response
@@ -844,11 +851,57 @@ whyInScopeTests = withSessionManager $ \getManager -> testGroup "agda_why_in_sco
       file <- exampleFile
       _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-why-in-scope-nonexistent", Types.format = Nothing })
 
-      let tool = Types.AgdaWhyInScope { Types.name = "nonExistentName123", Types.sessionId = Just "test-why-in-scope-nonexistent", Types.format = Nothing }
+      let tool = Types.AgdaWhyInScope { Types.name = "nonExistentName123", Types.inFile = Nothing, Types.atLine = Nothing, Types.sessionId = Just "test-why-in-scope-nonexistent", Types.format = Nothing }
       response <- runTool manager tool
 
       let kind = getField "kind" response
       assertEqual "Should be DisplayInfo" (Just (JSON.String "DisplayInfo")) kind
+  ]
+
+-- | Tests for agda_lookup, agda_goto_definition, and why_in_scope's fallback.
+-- LookupTest.agda defines Inner.double and uses it qualified and, unqualified,
+-- inside a where block that opens Inner, so at the top level `double` is not
+-- in scope.
+lookupTests :: TestTree
+lookupTests = withSessionManager $ \getManager -> testGroup "agda_lookup"
+  [ simpleTestCase "resolves a name used through a nested module" $ do
+      manager <- getManager
+      file <- lookupFile
+      _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-lookup", Types.format = Nothing })
+      response <- runTool manager (Types.AgdaLookup { Types.file = T.pack file, Types.symbol = "double", Types.atLine = Just 17, Types.sessionId = Just "test-lookup", Types.format = Nothing })
+      assertEqual "qualified name" (Just (JSON.String "LookupTest.Inner.double")) (getField "qualifiedName" response)
+      assertEqual "definition line" (Just (JSON.Number 7)) (getField "definitionLine" response)
+      assertEqual "use line" (Just (JSON.Number 17)) (getField "line" response)
+      assertEqual "type" (Just (JSON.String "Nat → Nat")) (getField "type" response)
+
+  , simpleTestCase "resolves a qualified use" $ do
+      manager <- getManager
+      file <- lookupFile
+      _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-lookup-qualified", Types.format = Nothing })
+      response <- runTool manager (Types.AgdaLookup { Types.file = T.pack file, Types.symbol = "Inner.double", Types.atLine = Just 13, Types.sessionId = Just "test-lookup-qualified", Types.format = Nothing })
+      assertEqual "qualified name" (Just (JSON.String "LookupTest.Inner.double")) (getField "qualifiedName" response)
+
+  , simpleTestCase "goto_definition resolves a position" $ do
+      manager <- getManager
+      file <- lookupFile
+      _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-goto", Types.format = Nothing })
+      response <- runTool manager (Types.AgdaGotoDefinition { Types.file = T.pack file, Types.line = 17, Types.column = 13, Types.sessionId = Just "test-goto", Types.format = Nothing })
+      assertEqual "qualified name" (Just (JSON.String "LookupTest.Inner.double")) (getField "qualifiedName" response)
+
+  , simpleTestCase "why_in_scope falls back to a use in the file" $ do
+      manager <- getManager
+      file <- lookupFile
+      _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-why-fallback", Types.format = Nothing })
+      txt <- runToolConcise manager (Types.AgdaWhyInScope { Types.name = "double", Types.inFile = Nothing, Types.atLine = Nothing, Types.sessionId = Just "test-why-fallback", Types.format = Nothing })
+      assertBool ("falls back: " ++ T.unpack txt) ("not in top-level scope" `T.isInfixOf` txt)
+      assertBool ("resolves it: " ++ T.unpack txt) ("LookupTest.Inner.double" `T.isInfixOf` txt)
+
+  , simpleTestCase "reports a name with no use" $ do
+      manager <- getManager
+      file <- lookupFile
+      _ <- runTool manager (Types.AgdaLoad { Types.file = T.pack file, Types.sessionId = Just "test-lookup-missing", Types.format = Nothing })
+      txt <- runToolConcise manager (Types.AgdaLookup { Types.file = T.pack file, Types.symbol = "nope", Types.atLine = Nothing, Types.sessionId = Just "test-lookup-missing", Types.format = Nothing })
+      assertBool ("says so: " ++ T.unpack txt) ("No use of nope" `T.isPrefixOf` txt)
   ]
 
 -- | Tests for agda_list_postulates
